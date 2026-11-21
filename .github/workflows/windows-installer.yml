@@ -1,0 +1,82 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: "x64"
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup -y --no-progress
+
+      - name: Verify release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: |
+          $path = "release-notes\${{ github.ref_name }}.md"
+          if (!(Test-Path -LiteralPath $path)) {
+            throw "Missing release notes: $path"
+          }
+          $notes = (Get-Content -LiteralPath $path -Raw).Trim()
+          if ($notes.Length -lt 80) {
+            throw "Release notes are too short: $path"
+          }
+          if ($notes -match '^Full Changelog:') {
+            throw "Release notes must describe the changes"
+          }
+
+      - name: Build installer
+        shell: powershell
+        run: >
+          powershell -NoProfile -ExecutionPolicy Bypass
+          -File packaging\build.ps1 -PythonLauncher "python"
+
+      - name: Verify tag matches application version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        run: |
+          $line = Get-Content app\version.py | Select-String '__version__\s*=\s*"([^"]+)"'
+          $version = $line.Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match app version $version"
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrowKit-Windows11
+          path: |
+            dist/installer/CrowKit-Setup-*.exe
+            dist/installer/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Publish GitHub prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $notesPath = "release-notes\$env:GITHUB_REF_NAME.md"
+          gh release create $env:GITHUB_REF_NAME `
+            "dist/installer/CrowKit-Setup-$version.exe" `
+            "dist/installer/SHA256SUMS.txt" `
+            --repo "${{ github.repository }}" `
+            --title "CrowKit $env:GITHUB_REF_NAME" `
+            --notes-file $notesPath `
+            --prerelease

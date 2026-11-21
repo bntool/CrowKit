@@ -1,0 +1,589 @@
+"""插件子进程生命周期管理与全局事件广播。"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import deque
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Callable
+
+from .error_policy import classify_user_error, friendly_user_message
+from .error_reports import extract_python_traceback
+from .paths import LOG_DIR
+
+_ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_SDK_DIR = _ROOT / "plugins"
+_SECRET_KEY_RE = re.compile(
+    r"(?:password|passwd|pwd|campus_password|api[_-]?key|apikey|token|secret|cookie)",
+    re.IGNORECASE,
+)
+_SENSITIVE_TEXT_RE = re.compile(
+    r"((?:password|passwd|pwd|campus_password|api[_-]?key|apikey|token|secret|cookie)"
+    r"\s*[:=]\s*)[^\s,;\"']+",
+    re.IGNORECASE,
+)
+_SENSITIVE_QUERY_RE = re.compile(
+    r"([?&](?:api[_-]?key|apikey|token|secret|password)=)[^&#\s]+",
+    re.IGNORECASE,
+)
+
+
+def _plugin_python_executable() -> str:
+    executable = Path(sys.executable)
+    if executable.name.lower() == "pythonw.exe":
+        console_python = executable.with_name("python.exe")
+        if console_python.is_file():
+            return str(console_python)
+    return str(executable)
+
+
+PYTHON_EXE = _plugin_python_executable()
+PLUGIN_BOOTSTRAP = (
+    "import os, runpy, sys;"
+    "sys.dont_write_bytecode=True;"
+    "entry=os.path.abspath(sys.argv[1]);"
+    "plugin_dir=os.path.dirname(entry);"
+    "plugins_dir=os.path.dirname(plugin_dir);"
+    "sdk_dir=os.path.abspath(sys.argv[2]);"
+    "sys.path[:0]=[plugin_dir,plugins_dir,sdk_dir];"
+    "sys.argv=[entry]+sys.argv[3:];"
+    "runpy.run_path(entry,run_name='__main__')"
+)
+
+STATUS_STOPPED = "stopped"
+STATUS_STARTING = "starting"
+STATUS_RUNNING = "running"
+STATUS_EXITED = "exited"
+STATUS_CRASHED = "crashed"
+STATUS_STOPPING = "stopping"
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _format_seconds(value: object) -> str:
+    try:
+        seconds = max(0, int(round(float(value))))
+    except (TypeError, ValueError):
+        return ""
+    minutes, second = divmod(seconds, 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours} 小时 {minute} 分"
+    if minutes:
+        return f"{minutes} 分 {second} 秒"
+    return f"{second} 秒"
+
+
+def _format_event(event: dict) -> str:
+    """Turn plugin events into compact, human-readable log lines."""
+    event_type = str(event.get("type") or "log")
+    if event_type == "log":
+        return str(event.get("line") or "")
+    if event_type == "status":
+        return f"[状态] {event.get('text') or '已更新'}"
+    if event_type == "plugin_status":
+        return f"[进程] {event.get('status') or '未知'}"
+    if event_type == "debug":
+        return f"[调试] {event.get('line') or event.get('event') or '已记录'}"
+    if event_type != "progress":
+        return f"[{event_type}]"
+
+    stage_names = {
+        "prepare": "准备任务",
+        "cache": "获取课程详情",
+        "study": "学习视频",
+        "qa": "答题与互动",
+        "catalog": "抓取专业目录",
+        "courses": "抓取课程列表",
+        "grab": "轮询选课",
+        "finish": "完成",
+    }
+    parts: list[str] = []
+    stage = event.get("stage")
+    if stage:
+        parts.append(stage_names.get(str(stage), str(stage)))
+    if event.get("round") is not None:
+        parts.append(f"第 {event['round']} 轮")
+    if event.get("done") is not None or event.get("total") is not None:
+        parts.append(f"{event.get('done', 0)}/{event.get('total', 0)}")
+    if event.get("course"):
+        parts.append(str(event["course"]))
+    if event.get("title"):
+        parts.append(str(event["title"]))
+    watched = event.get("watched_seconds")
+    total = event.get(
+        "required_seconds",
+        event.get("target_seconds", event.get("total_seconds")))
+    if watched is not None and total is not None:
+        parts.append(
+            f"服务器记录 {_format_seconds(watched)} / "
+            f"{_format_seconds(total)}")
+    elif event.get("percent") is not None:
+        parts.append(f"进度 {event['percent']}%")
+    eta = event.get("eta_seconds", event.get("eta_s"))
+    if eta is not None:
+        parts.append(f"剩余 {_format_seconds(eta)}")
+    if event.get("status"):
+        parts.append(f"状态 {event['status']}")
+    return "[进度] " + " · ".join(parts) if parts else "[进度] 已更新"
+
+
+class _PluginLogWriter:
+    """Write one rotating log per plugin and mirror readable events to console."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._loggers: dict[str, logging.Logger] = {}
+
+    def _logger(self, plugin_id: str) -> logging.Logger:
+        logger = self._loggers.get(plugin_id)
+        if logger is not None:
+            return logger
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path = LOG_DIR / "plugins" / f"{plugin_id}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger(
+            f"crowkit.plugin.{plugin_id}.{id(self)}")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=256 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(handler)
+        self._loggers[plugin_id] = logger
+        return logger
+
+    def write(self, plugin_id: str, event: dict) -> None:
+        line = _format_event(event)
+        if not line:
+            return
+        with self._lock:
+            self._logger(plugin_id).info(line)
+            print(f"[{plugin_id}] {line}", flush=True)
+
+
+_plugin_logs = _PluginLogWriter()
+
+
+class _RunLogWriter:
+    """Write one non-rotating file per plugin process run."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def write(self, path: Path, event: dict) -> None:
+        line = _format_event(event)
+        if not line:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                time.strftime("%Y-%m-%d %H:%M:%S ") + line + "\n")
+
+
+_run_logs = _RunLogWriter()
+
+
+def _collect_secret_values(value, out: set[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _SECRET_KEY_RE.search(str(key)) and isinstance(item, str):
+                if len(item) >= 4:
+                    out.add(item)
+            else:
+                _collect_secret_values(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_secret_values(item, out)
+
+
+def _sanitize_debug(value):
+    if isinstance(value, dict):
+        return {
+            key: (
+                "******" if _SECRET_KEY_RE.search(str(key)) and item
+                else _sanitize_debug(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_debug(item) for item in value]
+    return value
+
+
+def _redact_text(text: str, secrets: set[str]) -> str:
+    result = str(text)
+    for secret in sorted(secrets, key=len, reverse=True):
+        result = result.replace(secret, "******")
+    result = _SENSITIVE_TEXT_RE.sub(r"\1******", result)
+    return _SENSITIVE_QUERY_RE.sub(r"\1******", result)
+
+
+class EventBus:
+    """进程内事件广播:WebSocket 订阅者 + 环形日志缓冲(供前端回看)。"""
+
+    def __init__(self, history: int = 2000):
+        self._subs: set[Callable[[dict], None]] = set()
+        self._lock = threading.Lock()
+        self._history: deque[dict] = deque(maxlen=history)
+
+    def subscribe(self, callback: Callable[[dict], None]) -> Callable[[], None]:
+        with self._lock:
+            self._subs.add(callback)
+
+        def _unsub():
+            with self._lock:
+                self._subs.discard(callback)
+
+        return _unsub
+
+    def publish(self, event: dict) -> None:
+        with self._lock:
+            self._history.append(event)
+            subs = list(self._subs)
+        for cb in subs:
+            try:
+                cb(event)
+            except Exception:
+                pass
+
+    def recent(self, plugin_id: str | None = None, limit: int = 200) -> list[dict]:
+        with self._lock:
+            events = list(self._history)
+        if plugin_id is not None:
+            events = [e for e in events if e.get("plugin") == plugin_id]
+        return events[-limit:]
+
+
+_event_bus: EventBus | None = None
+_event_bus_lock = threading.Lock()
+
+
+def get_bus() -> EventBus:
+    global _event_bus
+    if _event_bus is None:
+        with _event_bus_lock:
+            if _event_bus is None:
+                _event_bus = EventBus()
+    return _event_bus
+
+
+class PluginProcess:
+    def __init__(
+        self,
+        plugin_id: str,
+        proc: subprocess.Popen,
+        config_path: Path,
+        secrets: set[str] | None = None,
+        run_id: str = "",
+        run_log_path: Path | None = None,
+    ):
+        self.plugin_id = plugin_id
+        self.proc = proc
+        self.config_path = config_path
+        self.secrets = secrets or set()
+        self.run_id = run_id
+        self.run_log_path = run_log_path
+        self.started_at = time.time()
+        self.status = STATUS_RUNNING
+        self.exit_code: int | None = None
+        self.stop_requested = False
+        # 最近一次 progress 事件(供 /api/plugins 轮询, 供不走 WebSocket 的
+        # 场景如自定义配置界面读取); 进程结束后清除避免陈旧进度
+        self.last_progress: dict | None = None
+        self.output_tail: deque[str] = deque(maxlen=300)
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """先发送温和停止信号,超时后结束整棵进程树。返回是否仍在运行。"""
+        if self.proc.poll() is not None:
+            return False
+        self.status = STATUS_STOPPING
+        try:
+            if os.name == "nt":
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_tree()
+        return self.proc.poll() is None
+
+    def _kill_tree(self) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                    capture_output=True, timeout=10, check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+
+class Runner:
+    """以子进程运行插件,采集 stdout/stderr 行并转换为事件。"""
+
+    def __init__(self, bus: EventBus | None = None):
+        self.bus = bus or get_bus()
+        self._processes: dict[str, PluginProcess] = {}
+        self._lock = threading.Lock()
+
+    # ---------- 查询 ----------
+
+    def snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            out = {}
+            for pid_name, pp in self._processes.items():
+                alive = pp.proc.poll() is None
+                if not alive and pp.status == STATUS_RUNNING:
+                    pp.status = STATUS_EXITED
+                    pp.exit_code = pp.proc.returncode
+                elif not alive and pp.status == STATUS_STOPPING:
+                    pp.status = STATUS_STOPPED
+                    pp.exit_code = pp.proc.returncode
+                running = alive and pp.status in (
+                    STATUS_STARTING, STATUS_RUNNING, STATUS_STOPPING)
+                out[pid_name] = {
+                    "running": running,
+                    "status": pp.status,
+                    "run_id": pp.run_id,
+                    "pid": pp.proc.pid if running else None,
+                    "started_at": pp.started_at,
+                    "progress": dict(pp.last_progress) if pp.last_progress else None,
+                }
+            return out
+
+    def is_running(self, plugin_id: str) -> bool:
+        return self.snapshot().get(plugin_id, {}).get("running", False)
+
+    # ---------- 生命周期 ----------
+
+    def start(
+        self,
+        plugin_id: str,
+        entry_path: Path,
+        config: dict,
+        data_dir: Path,
+        env_extra: dict[str, str] | None = None,
+    ) -> None:
+        with self._lock:
+            existing = self._processes.get(plugin_id)
+            if existing and existing.proc.poll() is None:
+                raise RuntimeError(f"插件 {plugin_id} 已在运行")
+            # 运行时配置含解密后的凭据, 使用唯一隐藏文件并在进程结束后删除。
+            _safe_unlink(data_dir / "runtime_config.json")
+            for stale in data_dir.glob(".runtime-*.json"):
+                _safe_unlink(stale)
+            config_path = data_dir / f".runtime-{uuid.uuid4().hex}.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            run_id = uuid.uuid4().hex
+            run_log_path = LOG_DIR / "runs" / plugin_id / f"{run_id}.log"
+
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            env["CROWKIT_RUN_ID"] = run_id
+            if env_extra:
+                env.update(env_extra)
+
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.CREATE_NO_WINDOW
+                )
+            popen_extra = {} if os.name == "nt" else {"start_new_session": True}
+
+            try:
+                proc = subprocess.Popen(
+                    [
+                        PYTHON_EXE, "-c", PLUGIN_BOOTSTRAP,
+                        str(entry_path),
+                        str(PLUGIN_SDK_DIR),
+                        "--config", str(config_path),
+                        "--datadir", str(data_dir),
+                    ],
+                    cwd=str(entry_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    creationflags=creationflags,
+                    **popen_extra,
+                )
+            except Exception:
+                _safe_unlink(config_path)
+                raise
+            secret_values: set[str] = set()
+            _collect_secret_values(config, secret_values)
+            pp = PluginProcess(
+                plugin_id, proc, config_path, secret_values,
+                run_id=run_id, run_log_path=run_log_path,
+            )
+            self._processes[plugin_id] = pp
+
+        # 启动标记必须先于首条子进程输出发布, 否则自定义界面按日志定位
+        # 本次任务起点时会漏掉启动早期的 progress。
+        self.bus.publish({
+            "type": "plugin_status", "plugin": plugin_id,
+            "status": STATUS_RUNNING, "pid": proc.pid, "run_id": pp.run_id,
+        })
+        startup_event = {
+            "type": "debug",
+            "event": "runtime_config",
+            "line": _redact_text(
+                "启动配置: " + json.dumps(
+                    _sanitize_debug(config), ensure_ascii=False, sort_keys=True),
+                secret_values,
+            ),
+        }
+        _plugin_logs.write(plugin_id, startup_event)
+        if pp.run_log_path is not None:
+            _run_logs.write(pp.run_log_path, startup_event)
+        t = threading.Thread(target=self._pump, args=(pp,), daemon=True, name=f"pump-{plugin_id}")
+        t.start()
+
+    def stop(self, plugin_id: str) -> None:
+        with self._lock:
+            pp = self._processes.get(plugin_id)
+        if not pp:
+            return
+        # 终态统一由 _pump 发布, 避免 exited/stopped 重复或顺序倒置。
+        pp.stop()
+
+    def request_stop(self, plugin_id: str) -> bool:
+        """Mark a plugin as stopping and tear it down off the API thread."""
+        with self._lock:
+            pp = self._processes.get(plugin_id)
+            if not pp or pp.proc.poll() is not None:
+                return False
+            if pp.stop_requested:
+                return True
+            pp.stop_requested = True
+            pp.status = STATUS_STOPPING
+        threading.Thread(
+            target=pp.stop,
+            daemon=True,
+            name=f"stop-{plugin_id}",
+        ).start()
+        return True
+
+    # ---------- 输出采集 ----------
+
+    def _pump(self, pp: PluginProcess) -> None:
+        proc = pp.proc
+        assert proc.stdout is not None
+        for raw_line in iter(proc.stdout.readline, ""):
+            line = raw_line.rstrip("\r\n")
+            if not line:
+                continue
+            line = _redact_text(line, pp.secrets)
+            pp.output_tail.append(line)
+            event = self._parse_line(pp.plugin_id, line)
+            if event.get("type") == "progress":
+                # 记录最近一次进度(过滤事件路由字段, 附加接收时间戳)
+                pp.last_progress = {
+                    k: v for k, v in event.items()
+                    if k not in ("type", "plugin", "__event__")
+                }
+                pp.last_progress["ts"] = round(time.time(), 3)
+            _plugin_logs.write(pp.plugin_id, event)
+            if pp.run_log_path is not None:
+                _run_logs.write(pp.run_log_path, event)
+            self.bus.publish(event)
+        code = proc.wait()
+        _safe_unlink(pp.config_path)
+        with self._lock:
+            if pp.status not in (STATUS_STOPPING,):
+                pp.status = STATUS_CRASHED if code not in (0, None) else STATUS_EXITED
+            else:
+                pp.status = STATUS_STOPPED
+            pp.exit_code = code
+            if pp.status == STATUS_STOPPED:
+                # User-requested stops always start from a clean progress state.
+                pp.last_progress = None
+        traceback_info = extract_python_traceback("\n".join(pp.output_tail))
+        error_message = ""
+        if traceback_info:
+            error_message = (
+                f"{traceback_info.get('type', '')}: "
+                f"{traceback_info.get('value', '')}"
+            ).strip(": ")
+        user_error = (
+            classify_user_error(error_message, *pp.output_tail)
+            if code not in (0, None) else None
+        )
+        user_message = (
+            friendly_user_message(error_message) if user_error else "")
+        self.bus.publish({
+            "type": "plugin_status", "plugin": pp.plugin_id,
+            "status": pp.status, "exit_code": code, "run_id": pp.run_id,
+            "error_message": error_message,
+            "user_message": user_message,
+            "expected": bool(user_error),
+            "user_error_category": (
+                user_error.get("category", "") if user_error else ""),
+        })
+
+    def run_log_path(self, plugin_id: str, run_id: str) -> Path | None:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", plugin_id)
+            or not re.fullmatch(r"[0-9a-f]{32}", run_id)
+        ):
+            return None
+        with self._lock:
+            process = self._processes.get(plugin_id)
+            if process and process.run_id == run_id and process.run_log_path:
+                if process.run_log_path.is_file():
+                    return process.run_log_path
+        path = LOG_DIR / "runs" / plugin_id / f"{run_id}.log"
+        return path if path.is_file() else None
+
+    @staticmethod
+    def _parse_line(plugin_id: str, line: str) -> dict:
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}") and "__event__" in stripped:
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, dict) and "__event__" in data:
+                    event = {**data, "plugin": plugin_id}
+                    event["type"] = str(data["__event__"])
+                    return event
+            except json.JSONDecodeError:
+                pass
+        return {"type": "log", "plugin": plugin_id, "line": line, "ts": time.time()}

@@ -1,0 +1,46 @@
+{
+  "id": "course-grab",
+  "name": "教务抢课",
+  "version": "1.8.0",
+  "description": "按课程与班级浏览完整排课信息，持续轮询北师大教务系统课程名额并自动提交。",
+  "repository": "https://github.com/bntool/CrowKit",
+  "host": {
+    "min_version": "0.1.6"
+  },
+  "entry": "plugin.py",
+  "config_ui": "ui.html",
+  "config_schema": [
+    {
+      "key": "specialty",
+      "label": "我的专业",
+      "type": "specialty",
+      "hint": "在自定义配置界面中选择专业并勾选课程;此项为所选专业的内部记录"
+    },
+    {
+      "key": "courses",
+      "label": "课程与班级",
+      "type": "course-table",
+      "hint": "课程代码 → 候选班级号列表"
+    },
+    {
+      "key": "course_order",
+      "label": "轮询顺序",
+      "type": "object",
+      "hint": "按课程代码与班级记录用户设置的轮询顺序"
+    },
+    {
+      "key": "poll_interval",
+      "label": "轮询间隔(秒)",
+      "type": "number",
+      "default": 3,
+      "min": 2,
+      "max": 60
+    },
+    {
+      "key": "headless",
+      "label": "无头模式",
+      "type": "bool",
+      "default": false
+    }
+  ]
+}

@@ -1,0 +1,141 @@
+<div class="crowkit-config" id="campus-auth-ui">
+  <div class="crowkit-row">
+    <button class="crowkit-btn crowkit-primary" id="campus-autostart-switch"
+      aria-pressed="false">设置开机自启</button>
+    <span class="crowkit-hint" id="campus-autostart-state">正在读取开机自启状态…</span>
+  </div>
+
+  <div class="crowkit-row">
+    <div class="crowkit-field">
+      <label for="campus-attempts">最大尝试次数</label>
+      <input type="number" id="campus-attempts" min="1" max="100" step="1">
+    </div>
+    <div class="crowkit-field">
+      <label for="campus-retry">重试间隔（秒）</label>
+      <input type="number" id="campus-retry" min="1" max="300" step="1">
+    </div>
+    <div class="crowkit-field">
+      <label for="campus-timeout">请求超时（秒）</label>
+      <input type="number" id="campus-timeout" min="2" max="60" step="1">
+    </div>
+  </div>
+
+  <div class="crowkit-alert" id="campus-msg" hidden></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var Z = window.BnuToolBoxConfigUI;
+  if (!Z) return;
+  var $ = function (id) { return document.getElementById(id); };
+  var pluginId = "campus-network-auth";
+  var saveTimer = null;
+  var installedAutostart = false;
+
+  function show(text, error) {
+    var el = $("campus-msg");
+    el.textContent = text;
+    el.className = "crowkit-alert" + (error ? " crowkit-error" : "");
+    el.hidden = false;
+  }
+
+  function config() {
+    return {
+      max_attempts: Math.max(1, Number($("campus-attempts").value) || 3),
+      retry_interval: Math.max(1, Number($("campus-retry").value) || 10),
+      request_timeout: Math.max(2, Number($("campus-timeout").value) || 10),
+      autostart: installedAutostart
+    };
+  }
+
+  async function saveConfig(silent) {
+    var cfg = config();
+    await Z.saveConfig(cfg);
+    if (!silent) Z.message("success", "校园网认证配置已保存");
+    return cfg;
+  }
+
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      saveConfig(true).catch(function () {
+        /* Input is temporarily incomplete while editing. */
+      });
+    }, 400);
+  }
+
+  function renderStatus(data) {
+    installedAutostart = !!(data && data.installed);
+    var button = $("campus-autostart-switch");
+    button.setAttribute("aria-pressed", installedAutostart ? "true" : "false");
+    button.textContent = "设置开机自启";
+    $("campus-autostart-state").textContent = installedAutostart
+      ? "开机自启已开启 · " + (data.method || "system")
+      : "开机自启已关闭";
+  }
+
+  async function loadStatus() {
+    try {
+      renderStatus(await Z.api("plugins/" + pluginId + "/autostart"));
+    } catch (e) {
+      $("campus-autostart-state").textContent =
+        "开机自启状态读取失败: " + e.message;
+    }
+  }
+
+  async function toggleAutostart() {
+    var enabled = !installedAutostart;
+    try {
+      await saveConfig(true);
+      var result = await Z.api("plugins/" + pluginId + "/autostart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: enabled })
+      });
+      if (result.ok === false) {
+        throw new Error(result.error || "开机自启配置失败");
+      }
+      renderStatus(result);
+      Z.message("success", enabled ? "已设置开机自启" : "已禁用开机自启");
+      show(enabled
+        ? "开机自启已开启。用户登录 Windows 后，系统会尝试完成校园网认证。"
+        : "开机自启已关闭。", false);
+    } catch (e) {
+      Z.message("error", e.message);
+      show("开机自启配置失败: " + e.message, true);
+    }
+  }
+
+  async function init() {
+    var cfg = await Z.getConfig();
+    $("campus-attempts").value = cfg.max_attempts || 3;
+    $("campus-retry").value = cfg.retry_interval || 10;
+    $("campus-timeout").value = cfg.request_timeout || 10;
+
+    $("campus-autostart-switch").addEventListener("click", toggleAutostart);
+    ["campus-attempts", "campus-retry", "campus-timeout"].forEach(function (id) {
+      $(id).addEventListener("change", scheduleSave);
+    });
+    await loadStatus();
+    window.BnuToolBoxCampusSave = function () {
+      return saveConfig(true).then(function () {
+        return true;
+      }).catch(function (e) {
+        Z.message("error", e.message);
+        return false;
+      });
+    };
+    window.BnuToolBoxPluginSave = window.BnuToolBoxCampusSave;
+    window.addEventListener("beforeunload", function () {
+      if (saveTimer) clearTimeout(saveTimer);
+      delete window.BnuToolBoxCampusSave;
+      delete window.BnuToolBoxPluginSave;
+    });
+  }
+
+  init().catch(function (e) {
+    show("配置界面初始化失败: " + e.message, true);
+  });
+})();
+</script>
