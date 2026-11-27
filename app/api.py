@@ -49,6 +49,7 @@ pm = PluginManager(runner)
 plugin_catalog = PluginCatalog(pm)
 _BDATA_ID = "bdata-autoplay"
 _CAMPUS_AUTH_ID = "campus-network-auth"
+_COURSE_EVAL_ID = "course-eval"
 
 # ---------------- 窗口关闭自动退出 ----------------
 # 页面通过 WebSocket 保持连接;所有客户端断开且宽限期内无人重连(如页面刷新)时,
@@ -241,6 +242,120 @@ def get_selected_plugin_account(plugin_id: str):
             "major": str(account.get("major") or ""),
         },
     }
+
+
+@api_router.get("/plugins/course-eval/cache")
+def get_course_eval_cache():
+    account = _course_eval_account()
+    if not account.get("id"):
+        return {
+            "ok": True,
+            "account": None,
+            "count": 0,
+            "saved_at": "",
+            "cookies_saved_at": "",
+        }
+    path = _course_eval_cache_path()
+    data = _read_course_eval_cache(path)
+    entry = _course_eval_cache_entry(data, account)
+    return {
+        "ok": True,
+        "account": {
+            "id": str(account.get("id") or ""),
+            "username": str(account.get("username") or ""),
+            "nickname": str(account.get("nickname") or ""),
+        },
+        "count": len(entry.get("courses") or []) if entry else 0,
+        "saved_at": str(entry.get("saved_at") or "") if entry else "",
+        "cookies_saved_at": (
+            str(entry.get("cookies_saved_at") or "") if entry else ""),
+    }
+
+
+@api_router.post("/plugins/course-eval/cache/clear")
+def clear_course_eval_cache():
+    if runner.is_running(_COURSE_EVAL_ID):
+        raise HTTPException(409, "插件正在运行，请先停止")
+    account = _course_eval_account()
+    if not account.get("id"):
+        raise HTTPException(409, "请先在账号管理中选择账号")
+    path = _course_eval_cache_path()
+    data = _read_course_eval_cache(path)
+    removed = 0
+    saved_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    for key in _course_eval_cache_keys(account):
+        entry = data["accounts"].get(key)
+        if not isinstance(entry, dict):
+            continue
+        courses = entry.get("courses")
+        if isinstance(courses, list):
+            removed += len(courses)
+        entry["courses"] = []
+        entry["saved_at"] = saved_at
+    _write_course_eval_cache(path, data)
+    return {"ok": True, "removed": removed, "count": 0}
+
+
+def _course_eval_account() -> dict:
+    return global_config.resolve_account(
+        account_selections.get(_COURSE_EVAL_ID))
+
+
+def _course_eval_cache_path() -> Path:
+    return pm.plugin_data_dir(_COURSE_EVAL_ID) / "session.json"
+
+
+def _course_eval_cache_keys(account: dict) -> set[str]:
+    return {
+        str(account.get(key) or "")
+        for key in ("id", "username")
+        if account.get(key)
+    }
+
+
+def _course_eval_cache_entry(data: dict, account: dict) -> dict | None:
+    for key in _course_eval_cache_keys(account):
+        entry = data.get("accounts", {}).get(key)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _read_course_eval_cache(path: Path) -> dict:
+    empty = {"version": 2, "accounts": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if isinstance(data.get("accounts"), dict):
+        return data
+    account = str(data.get("account") or "").strip()
+    if not account:
+        return empty
+    entry = {
+        "account": {"username": account},
+        "saved_at": str(data.get("saved_at") or ""),
+        "cookies_saved_at": str(data.get("cookies_saved_at") or ""),
+        "cookies": data.get("cookies") or [],
+        "courses": data.get("courses") or [],
+    }
+    return {"version": 2, "accounts": {account: entry}}
+
+
+def _write_course_eval_cache(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @api_router.get("/plugins/catalog")

@@ -1968,7 +1968,7 @@
             <h2>任务流程</h2>
             <span class="form-hint">完成后自动更新</span>
           </div>
-          <ol class="run-flow" aria-label="任务步骤">
+          <ol class="run-flow" :class="{ 'run-flow-many': runMainSteps(detailPlugin.id).length > 5 }" aria-label="任务步骤">
             <li
               v-for="(step, index) in runMainSteps(detailPlugin.id)"
               :key="step.key"
@@ -2115,29 +2115,41 @@
                   </div>
                 </el-form-item>
                 <el-form-item v-else-if="f.type==='choice'" :label="f.label">
-                  <el-select v-model="state.detailConfig[f.key]" style="width:100%">
-                    <el-option
-                      v-for="(c, i) in (f.choices || [])" :key="c"
-                      :value="c"
-                      :label="(f.choice_labels && f.choice_labels[i]) || c" />
-                  </el-select>
+                  <div style="width:100%">
+                    <el-select v-model="state.detailConfig[f.key]" style="width:100%">
+                      <el-option
+                        v-for="(c, i) in (f.choices || [])" :key="c"
+                        :value="c"
+                        :label="(f.choice_labels && f.choice_labels[i]) || c" />
+                    </el-select>
+                    <div class="form-hint" style="margin-top:4px" v-if="f.hint">{{ f.hint }}</div>
+                  </div>
                 </el-form-item>
                 <el-form-item v-else-if="f.type==='number'" :label="f.label">
-                  <el-input-number
-                    v-model="state.detailConfig[f.key]"
-                    :min="f.min !== undefined ? f.min : -Infinity"
-                    :max="f.max !== undefined ? f.max : Infinity"
-                    :step="f.step || 1" />
+                  <div style="width:100%">
+                    <el-input-number
+                      v-model="state.detailConfig[f.key]"
+                      :min="f.min !== undefined ? f.min : -Infinity"
+                      :max="f.max !== undefined ? f.max : Infinity"
+                      :step="f.step || 1" />
+                    <div class="form-hint" style="margin-top:4px" v-if="f.hint">{{ f.hint }}</div>
+                  </div>
                 </el-form-item>
                 <el-form-item v-else-if="f.type==='bool'" :label="f.label">
-                  <el-switch v-model="state.detailConfig[f.key]" />
+                  <div style="width:100%">
+                    <el-switch v-model="state.detailConfig[f.key]" />
+                    <div class="form-hint" style="margin-top:4px" v-if="f.hint">{{ f.hint }}</div>
+                  </div>
                 </el-form-item>
                 <el-form-item v-else :label="f.label">
-                  <el-input
-                    v-model="state.detailConfig[f.key]"
-                    :type="f.type==='password' ? 'password' : 'text'"
-                    :show-password="f.type==='password'"
-                    :placeholder="f.type==='password' ? '已加密存储' : ''" />
+                  <div style="width:100%">
+                    <el-input
+                      v-model="state.detailConfig[f.key]"
+                      :type="f.type==='password' ? 'password' : 'text'"
+                      :show-password="f.type==='password'"
+                      :placeholder="f.type==='password' ? '已加密存储' : ''" />
+                    <div class="form-hint" style="margin-top:4px" v-if="f.hint">{{ f.hint }}</div>
+                  </div>
                 </el-form-item>
               </template>
             </el-form>

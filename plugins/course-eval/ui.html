@@ -1,0 +1,155 @@
+<div class="crowkit-config" id="course-eval-ui">
+  <div class="crowkit-row">
+    <div class="crowkit-field">
+      <label for="course-eval-workers">并行浏览器数</label>
+      <input type="number" id="course-eval-workers" min="1" max="10" step="1">
+    </div>
+    <span class="crowkit-hint">并行评教仅支持无头模式，默认使用 5 个浏览器。</span>
+  </div>
+
+  <div class="crowkit-hint">
+    如果有不想打好评的课程，请先手动完成评教后再启动此脚本；插件只会处理仍处于“待评教”状态的课程。
+  </div>
+
+  <div class="crowkit-row">
+    <button class="crowkit-btn crowkit-warning" id="course-eval-clear-cache">
+      清除课程列表缓存
+    </button>
+    <span class="crowkit-hint" id="course-eval-cache-state">正在读取缓存状态…</span>
+  </div>
+
+  <div class="crowkit-hint">
+    新学期新评教请清除旧缓存。清除后下次启动会重新抓取课程评教地址。
+  </div>
+
+  <div class="crowkit-alert" id="course-eval-msg" hidden></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var Z = window.BnuToolBoxConfigUI;
+  if (!Z) return;
+  var pluginId = "course-eval";
+  var $ = function (id) { return document.getElementById(id); };
+  var cfg = {};
+  var saveTimer = null;
+
+  function show(text, error) {
+    var el = $("course-eval-msg");
+    el.textContent = text;
+    el.className = "crowkit-alert" + (error ? " crowkit-error" : "");
+    el.hidden = false;
+  }
+
+  async function saveConfig(silent) {
+    var workers = Math.max(1, Math.min(10,
+      Math.round(Number($("course-eval-workers").value) || 5)));
+    var next = Object.assign({}, cfg, { workers: workers });
+    delete next.headless;
+    delete next.dry_run;
+    delete next.submit_wait;
+    await Z.saveConfig(next);
+    cfg = next;
+    if (!silent) Z.message("success", "自动评教配置已保存");
+    return next;
+  }
+
+  function scheduleSave() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      saveConfig(true).catch(function () {
+        /* 配置输入过程中允许暂时保存失败。 */
+      });
+    }, 400);
+  }
+
+  async function refreshCache() {
+    var state = $("course-eval-cache-state");
+    if (!state) return;
+    try {
+      var data = await Z.api("plugins/" + pluginId + "/cache");
+      if (!data.account) {
+        state.textContent = "未选择账号，无法读取课程缓存";
+        return;
+      }
+      var who = data.account.nickname || data.account.username || "当前账号";
+      if (Number(data.count) > 0) {
+        state.textContent = who + " 已缓存 " + data.count + " 门课程"
+          + (data.saved_at ? "（" + data.saved_at + "）" : "");
+      } else {
+        state.textContent = who + " 暂无课程缓存，下次启动会重新抓取";
+      }
+    } catch (e) {
+      state.textContent = "缓存状态读取失败：" + e.message;
+    }
+  }
+
+  function onAccountChanged(event) {
+    if (!document.getElementById("course-eval-ui")) {
+      window.removeEventListener("crowkit-account-changed", onAccountChanged);
+      if (window.__courseEvalAccountChanged === onAccountChanged) {
+        delete window.__courseEvalAccountChanged;
+      }
+      return;
+    }
+    if (!event.detail || event.detail.pluginId !== pluginId) return;
+    refreshCache();
+  }
+
+  async function clearCache() {
+    var button = $("course-eval-clear-cache");
+    button.disabled = true;
+    try {
+      await saveConfig(true);
+      await Z.post("plugins/" + pluginId + "/cache/clear", {});
+      await refreshCache();
+      Z.message("success", "课程列表缓存已清除");
+      show("已清除当前账号的课程列表缓存。下次启动会重新抓取评教地址。", false);
+    } catch (e) {
+      Z.message("error", e.message);
+      show("清除课程列表缓存失败：" + e.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function init() {
+    cfg = await Z.getConfig();
+    var workers = Number(cfg.workers);
+    $("course-eval-workers").value = Number.isFinite(workers)
+      ? Math.max(1, Math.min(10, Math.round(workers))) : 5;
+    $("course-eval-workers").addEventListener("change", scheduleSave);
+    $("course-eval-clear-cache").addEventListener("click", clearCache);
+    if (window.__courseEvalAccountChanged) {
+      window.removeEventListener(
+        "crowkit-account-changed", window.__courseEvalAccountChanged);
+    }
+    window.__courseEvalAccountChanged = onAccountChanged;
+    window.addEventListener("crowkit-account-changed", onAccountChanged);
+    window.BnuToolBoxCourseEvalSave = function () {
+      return saveConfig(true).then(function () {
+        return true;
+      }).catch(function (e) {
+        Z.message("error", e.message);
+        return false;
+      });
+    };
+    window.BnuToolBoxPluginSave = window.BnuToolBoxCourseEvalSave;
+    await refreshCache();
+    window.addEventListener("beforeunload", function () {
+      if (saveTimer) clearTimeout(saveTimer);
+      window.removeEventListener("crowkit-account-changed", onAccountChanged);
+      if (window.__courseEvalAccountChanged === onAccountChanged) {
+        delete window.__courseEvalAccountChanged;
+      }
+      delete window.BnuToolBoxCourseEvalSave;
+      delete window.BnuToolBoxPluginSave;
+    });
+  }
+
+  init().catch(function (e) {
+    show("配置界面初始化失败：" + e.message, true);
+  });
+})();
+</script>

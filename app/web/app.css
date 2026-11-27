@@ -480,6 +480,51 @@ html, body, #app {
 .run-step-copy { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .run-step-copy strong { font-size: 13px; line-height: 1.35; }
 .run-step-copy small { color: var(--crowkit-text-secondary); font-size: 11px; }
+
+/* 多节点任务按卡片分行排列，避免长流程只能横向滚动 */
+.run-flow.run-flow-many {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  overflow-x: visible;
+  padding: 14px;
+}
+.run-flow.run-flow-many .run-step {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 3px 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--crowkit-border);
+  border-radius: 9px;
+  background: var(--crowkit-bg);
+  text-align: left;
+}
+.run-flow.run-flow-many .run-step:not(:last-child)::after { display: none; }
+.run-flow.run-flow-many .run-step-marker {
+  grid-row: 1 / span 2;
+  width: 30px;
+  height: 30px;
+  font-size: 12px;
+}
+.run-flow.run-flow-many .run-step-copy { gap: 1px; }
+.run-flow.run-flow-many .run-step-copy strong {
+  overflow-wrap: anywhere;
+  font-size: 12.5px;
+  line-height: 1.3;
+}
+.run-flow.run-flow-many .run-step-copy small { font-size: 10.5px; }
+.run-flow.run-flow-many .run-step.is-done {
+  border-color: color-mix(in srgb, var(--crowkit-success) 50%, var(--crowkit-border));
+}
+.run-flow.run-flow-many .run-step.is-active {
+  border-color: var(--crowkit-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--crowkit-accent) 11%, transparent);
+}
+.run-flow.run-flow-many .run-step.is-error {
+  border-color: var(--crowkit-danger);
+  background: color-mix(in srgb, var(--crowkit-danger) 5%, var(--crowkit-bg));
+}
 .inline-progress-row {
   display: grid;
   grid-template-columns: minmax(200px, 280px) minmax(0, 1fr);

@@ -1,0 +1,24 @@
+{
+  "id": "course-eval",
+  "name": "自动评教",
+  "version": "1.3.0",
+  "description": "登录北师大评教系统，按账号缓存并复用待评课程的评教地址，使用多个无头浏览器并行完成期末学生评教问卷并提交。如果有不想打好评的课程，请先手动完成评教后再启动此脚本；已评教课程会自动跳过。",
+  "repository": "https://github.com/bntool/CrowKit",
+  "host": {
+    "min_version": "0.2.0"
+  },
+  "entry": "plugin.py",
+  "config_ui": "ui.html",
+  "config_schema": [
+    {
+      "key": "workers",
+      "label": "并行浏览器数",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 10,
+      "step": 1,
+      "hint": "并行评教仅支持无头模式；默认使用 5 个浏览器。"
+    }
+  ]
+}
